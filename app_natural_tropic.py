@@ -1,6 +1,9 @@
 import os
+import gzip
+import shutil
 import sqlite3
 import json
+import unicodedata
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -39,6 +42,7 @@ st.markdown(
 )
 
 DB_FILE = "natural_tropic_planta.db"
+DB_GZ_FILE = "natural_tropic_planta.db.gz"
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", "1234") if hasattr(st, "secrets") else "1234"
 
 LINES_LIST = [
@@ -86,9 +90,19 @@ OWN_GROUP_MAP = {
 
 
 # =============================================================================
-# 2. BASE DE DATOS SQLITE COMPARTIDA
+# 2. BASE DE DATOS SQLITE, AUTO-DESCOMPRESIÓN Y PERSISTENCIA EN GITHUB
 # =============================================================================
 def init_db():
+    # Si Streamlit despierta tras el fin de semana, restaura automáticamente desde natural_tropic_planta.db.gz
+    if os.path.exists(DB_GZ_FILE):
+        if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) < 10000:
+            try:
+                with gzip.open(DB_GZ_FILE, "rb") as f_in:
+                    with open(DB_FILE, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+            except Exception:
+                pass
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -119,6 +133,34 @@ def init_db():
     conn.close()
 
 
+def create_compressed_backup():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as f_in:
+            with gzip.open(DB_GZ_FILE, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+
+def sync_db_to_github():
+    """Comprime la base de datos a .db.gz y la guarda automáticamente en GitHub si GITHUB_TOKEN está configurado."""
+    create_compressed_backup()
+    try:
+        if hasattr(st, "secrets") and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+            from github import Github
+            g = Github(st.secrets["GITHUB_TOKEN"])
+            repo = g.get_repo(st.secrets["GITHUB_REPO"])
+            with open(DB_GZ_FILE, "rb") as f:
+                content = f.read()
+            try:
+                contents = repo.get_contents(DB_GZ_FILE)
+                repo.update_file(contents.path, "Auto-backup datos Natural Tropic (.db.gz)", content, contents.sha)
+            except Exception:
+                repo.create_file(DB_GZ_FILE, "Backup inicial datos Natural Tropic (.db.gz)", content)
+            return True, "✅ Sincronizado automáticamente en GitHub (.db.gz)"
+    except Exception as e:
+        return False, f"⚠️ Guardado local (GitHub Sync error: {e})"
+    return False, "ℹ️ Guardado en sesión (Descarga el archivo .db.gz y súbelo a GitHub o configura GITHUB_TOKEN)"
+
+
 def get_config(key, default_val):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -133,10 +175,7 @@ def get_config(key, default_val):
 def set_config(key, val):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO config_store (k, v) VALUES (?, ?)",
-        (key, json.dumps(val)),
-    )
+    c.execute("INSERT OR REPLACE INTO config_store (k, v) VALUES (?, ?)", (key, json.dumps(val)))
     conn.commit()
     conn.close()
 
@@ -145,63 +184,120 @@ init_db()
 
 
 # =============================================================================
-# 3. MOTOR DE LECTURA Y LIMPIEZA (4 PESTAÑAS EXCEL O TXT DIARIOS)
+# 3. MOTOR BLINDADO DE LECTURA (ANTI-ERRORES DE TILDES, FECHAS Y LÍNEAS)
 # =============================================================================
+def norm_str(s):
+    """Elimina tildes, espacios dobles y caracteres extraños para comparar nombres sin fallos."""
+    if s is None or pd.isna(s):
+        return ""
+    s = str(s).strip().upper()
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+
+def find_col(df, candidates):
+    """Encuentra una columna en el DataFrame aunque tenga problemas de tildes (ej. LÃ­nea o Linea)."""
+    norm_cols = {norm_str(c): c for c in df.columns}
+    for cand in candidates:
+        nc = norm_str(cand)
+        if nc in norm_cols:
+            return norm_cols[nc]
+    # Búsqueda parcial por si la tilde se rompió en UTF-8/Latin1 (ej. 'LÃ­nea producciÃ³n')
+    for col in df.columns:
+        c_up = str(col).upper()
+        for cand in candidates:
+            if cand.upper() == "LÍNEA PRODUCCIÓN" and "PRODUCCI" in c_up and ("L" in c_up):
+                return col
+            if cand.upper() == "LÍNEA" and c_up.startswith("L") and c_up.endswith("NEA") and "PROD" not in c_up:
+                return col
+            if cand.upper() == "OPERACIÓN" and "OPERACI" in c_up:
+                return col
+            if cand.upper() == "POSICIÓN" and "POSICI" in c_up:
+                return col
+            if cand.upper() == "CONFECCIÓN" and "CONFECCI" in c_up:
+                return col
+            if cand.upper() == "CATEGORIA" and "CATEGOR" in c_up:
+                return col
+    return None
+
+
 def map_linea_real(raw_val, existing_real=None):
-    if pd.notna(existing_real):
-        s_ex = str(existing_real).strip()
-        if s_ex in LINES_LIST:
-            return s_ex
-    if pd.isna(raw_val):
-        return None
-    lin = str(raw_val).strip().upper()
-    if not lin or lin == "NAN":
-        return None
-    if lin.startswith("FP") or "FLOWPACK" in lin:
-        return "Flowpack"
-    if lin.startswith("CA1"):
-        return "C1 Mango"
-    if lin.startswith("CA2"):
-        return "C2 Chirimoya"
-    if lin.startswith("GIRSAC"):
-        return "Girsac"
-    if lin in ["MANGO", "MESA AUX B"]:
-        return "Mango"
-    if lin == "MESA AUX":
-        return "Repaso"
-    if lin.startswith("MULTISCAN") and "PISTACHO" not in lin:
-        return "Multiscan"
-    if lin == "PITAYA":
-        return "Pitaya"
-    if lin in ["VERDE1 AGU", "VERDE"]:
-        return "Verde"
-    if lin in ["VERDE2 AGU", "VERDE 2"]:
-        return "Verde 2"
+    """Mapea tanto 'Linea real' ya escrita en Excel como 'Línea' / 'Línea producción' en crudo de TXT."""
+    for val in [existing_real, raw_val]:
+        if val is None or pd.isna(val):
+            continue
+        lin = norm_str(val)
+        if not lin or lin == "NAN":
+            continue
+        if "PISTACHO" in lin or lin in ["LIMPIADO", "TOSTADORA", "ENVASADORA", "PARTIDORA", "3UVISION"]:
+            continue
+        if lin in ["FLOWPACK", "FP"] or lin.startswith("FP") or "FLOWPACK" in lin:
+            return "Flowpack"
+        if lin in ["C1 MANGO", "C1MANGO", "CALIBRADOR 1", "CALIBRADOR1"] or lin.startswith("CA1") or lin.startswith("C1"):
+            return "C1 Mango"
+        if lin in ["C2 CHIRIMOYA", "C2CHIRIMOYA", "CHIRIMOYA"] or lin.startswith("CA2") or lin.startswith("C2"):
+            return "C2 Chirimoya"
+        if "GIRSAC" in lin or lin == "MALLAS":
+            return "Girsac"
+        if lin in ["MANGO", "MESA AUX B", "MESA AUXILIAR B"]:
+            return "Mango"
+        if lin in ["REPASO", "MESA AUX", "MESA AUXILIAR", "MANGO REPASO", "CONTROL PRODUCCION AUXILIAR"]:
+            return "Repaso"
+        if "MULTISCAN" in lin:
+            return "Multiscan"
+        if "PITAYA" in lin:
+            return "Pitaya"
+        if lin in ["VERDE 2", "VERDE2", "VERDE2 AGU"] or lin.startswith("VERDE2") or lin.startswith("VERDE 2"):
+            return "Verde 2"
+        if lin in ["VERDE", "VERDE 1", "VERDE1", "VERDE1 AGU"] or lin.startswith("VERDE1") or lin.startswith("VERDE 1"):
+            return "Verde"
     return None
 
 
 def clean_num_series(s):
     if s is None:
         return 0.0
+    if isinstance(s, (int, float)):
+        return float(s)
     if pd.api.types.is_numeric_dtype(s):
         return s.fillna(0.0).astype(float)
-    return (
-        pd.to_numeric(
-            s.astype(str).str.strip().str.replace(",", ".", regex=False),
-            errors="coerce",
-        )
-        .fillna(0.0)
-        .astype(float)
+    # Limpiar posibles separadores de miles y cambiar coma decimal por punto
+    s_str = s.astype(str).str.strip().str.replace("€", "", regex=False).str.replace(" ", "", regex=False)
+    has_comma = s_str.str.contains(",", regex=False)
+    has_dot = s_str.str.contains(".", regex=False)
+    s_clean = np.where(
+        has_comma & has_dot,
+        s_str.str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+        s_str.str.replace(",", ".", regex=False),
     )
+    return pd.to_numeric(pd.Series(s_clean, index=s.index), errors="coerce").fillna(0.0).astype(float)
+
+
+def parse_robust_dates(raw_series):
+    """Convierte fechas de Excel (Timestamp, números serie, YYYY-MM-DD) y TXT (DD/MM/YYYY) sin invertir jamás mes y día."""
+    if pd.api.types.is_datetime64_any_dtype(raw_series):
+        return pd.to_datetime(raw_series, errors="coerce")
+
+    def _parse_val(v):
+        if pd.isna(v):
+            return pd.NaT
+        if isinstance(v, (pd.Timestamp, np.datetime64)):
+            return pd.Timestamp(v)
+        if isinstance(v, (int, float)) and 35000 < v < 60000:
+            return pd.Timestamp("1899-12-30") + pd.Timedelta(days=int(v))
+        s = str(v).strip().split(" ")[0]
+        if not s or s.upper() == "NAN":
+            return pd.NaT
+        # Si empieza por 4 dígitos (YYYY-MM-DD o YYYY/MM/DD), NUNCA usar dayfirst=True
+        if len(s) >= 8 and s[:4].isdigit() and s[4] in ["-", "/"]:
+            return pd.to_datetime(s, format="%Y-%m-%d" if "-" in s else "%Y/%m/%d", errors="coerce")
+        # Si es formato español DD/MM/YYYY o DD-MM-YYYY
+        return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
+    return raw_series.apply(_parse_val)
 
 
 def enrich_dates(df, date_col):
-    raw_s = df[date_col]
-    dt = pd.to_datetime(raw_s, dayfirst=True, errors="coerce")
-    mask_na = dt.isna()
-    if mask_na.any():
-        dt_iso = pd.to_datetime(raw_s[mask_na], errors="coerce")
-        dt.loc[mask_na] = dt_iso
+    dt = parse_robust_dates(df[date_col])
     df = df.loc[dt.notna()].copy()
     dt = dt.loc[dt.notna()]
 
@@ -219,15 +315,18 @@ def enrich_dates(df, date_col):
 
 
 def parse_mov_df(df):
-    df.columns = [str(c).strip() for c in df.columns]
-    if "Fecha" not in df.columns:
+    if df is None or df.empty:
         return pd.DataFrame()
-    df = enrich_dates(df, "Fecha")
+    df.columns = [str(c).strip() for c in df.columns]
+    col_fecha = find_col(df, ["Fecha"])
+    if not col_fecha:
+        return pd.DataFrame()
+    df = enrich_dates(df, col_fecha)
     if df.empty:
         return pd.DataFrame()
 
-    col_lin = "Línea producción" if "Línea producción" in df.columns else None
-    col_real = "Linea real" if "Linea real" in df.columns else None
+    col_lin = find_col(df, ["Línea producción", "Linea produccion", "Línea", "Linea"])
+    col_real = find_col(df, ["Linea real", "Línea real"])
     df["lReal"] = [
         map_linea_real(
             df[col_lin].iloc[i] if col_lin else None,
@@ -235,36 +334,48 @@ def parse_mov_df(df):
         )
         for i in range(len(df))
     ]
-    df["cajas"] = clean_num_series(df.get("Cajas", 0))
-    df["kgTeo"] = clean_num_series(df.get("Neto teo.", 0))
-    df["kgReal"] = clean_num_series(df.get("Neto real", 0))
-    df["emb"] = (
-        df.get("Embalaje", pd.Series([""] * len(df), index=df.index))
-        .fillna("").astype(str).str.strip().str.upper()
-    )
-    df["conf"] = (
-        df.get("Confección", pd.Series([""] * len(df), index=df.index))
-        .fillna("").astype(str).str.strip().str.upper()
-    )
+    col_cajas = find_col(df, ["Cajas"])
+    col_teo = find_col(df, ["Neto teo.", "Neto teo", "Neto teorico"])
+    col_real_kg = find_col(df, ["Neto real"])
+    col_emb = find_col(df, ["Embalaje"])
+    col_conf = find_col(df, ["Confección", "Confeccion"])
+    col_pos = find_col(df, ["Posición", "Posicion"])
+    col_cat = find_col(df, ["Categoria", "Categoría"])
+    col_cli = find_col(df, ["Cliente"])
+
+    df["cajas"] = clean_num_series(df[col_cajas]) if col_cajas else 0.0
+    df["kgTeo"] = clean_num_series(df[col_teo]) if col_teo else 0.0
+    df["kgReal"] = clean_num_series(df[col_real_kg]) if col_real_kg else 0.0
+    df["emb"] = df[col_emb].fillna("").astype(str).str.strip().str.upper() if col_emb else ""
+    df["conf"] = df[col_conf].fillna("").astype(str).str.strip().str.upper() if col_conf else ""
     df["conf"] = np.where(df["conf"] == "", df["emb"], df["conf"])
-    pos = df.get("Posición", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).str.upper()
-    cat = df.get("Categoria", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).str.upper()
+    pos = df[col_pos].fillna("").astype(str).str.upper() if col_pos else pd.Series([""] * len(df), index=df.index)
+    cat = df[col_cat].fillna("").astype(str).str.upper() if col_cat else pd.Series([""] * len(df), index=df.index)
     df["isDestrio"] = ((cat == "DX") | pos.str.contains("DESTRIO|BASURA|ACEITE|PODRIDO|GUACAMOLE", regex=True)).astype(int)
     df["isInterno"] = ((df["emb"] == "USOINT") | pos.str.contains("REPASO|USO|SOBRANTE|DESCALIBRADO", regex=True)).astype(int)
-    df["cliente"] = df.get("Cliente", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).str.strip()
+    df["cliente"] = df[col_cli].fillna("").astype(str).str.strip() if col_cli else ""
     return df[["dISO", "y", "mISO", "wISO", "lReal", "conf", "emb", "cajas", "kgTeo", "kgReal", "isDestrio", "isInterno", "cliente"]]
 
 
 def parse_ven_df(df):
-    df.columns = [str(c).strip() for c in df.columns]
-    if "Fecha" not in df.columns:
+    if df is None or df.empty:
         return pd.DataFrame()
-    df = enrich_dates(df, "Fecha")
+    df.columns = [str(c).strip() for c in df.columns]
+    col_fecha = find_col(df, ["Fecha"])
+    if not col_fecha:
+        return pd.DataFrame()
+    df = enrich_dates(df, col_fecha)
     if df.empty:
         return pd.DataFrame()
 
-    col_lin = "Línea producción" if "Línea producción" in df.columns else None
-    col_real = "Linea real" if "Linea real" in df.columns else None
+    # Filtrar devoluciones si existe 'Tipo mov.' == 'D' (como en el filtro "Sin devoluciones" del Excel)
+    col_tmov = find_col(df, ["Tipo mov.", "Tipo mov"])
+    if col_tmov:
+        tmov_s = df[col_tmov].fillna("").astype(str).str.strip().str.upper()
+        df = df[~tmov_s.isin(["D", "DEV", "DEVOLUCION"])].copy()
+
+    col_lin = find_col(df, ["Línea producción", "Linea produccion", "Línea", "Linea"])
+    col_real = find_col(df, ["Linea real", "Línea real"])
     df["lReal"] = [
         map_linea_real(
             df[col_lin].iloc[i] if col_lin else None,
@@ -272,24 +383,51 @@ def parse_ven_df(df):
         )
         for i in range(len(df))
     ]
-    df["cajas"] = clean_num_series(df.get("Cajas", 0))
-    df["kgTeo"] = clean_num_series(df.get("Neto teo.", 0))
-    df["kgReal"] = clean_num_series(df.get("Neto real", 0))
-    df["cliente"] = df.get("Cliente", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).str.strip()
+    col_cajas = find_col(df, ["Cajas"])
+    col_teo = find_col(df, ["Neto teo.", "Neto teo", "Neto teorico"])
+    col_real_kg = find_col(df, ["Neto real"])
+    col_cli = find_col(df, ["Cliente"])
+
+    df["cajas"] = clean_num_series(df[col_cajas]) if col_cajas else 0.0
+    df["kgTeo"] = clean_num_series(df[col_teo]) if col_teo else 0.0
+    df["kgReal"] = clean_num_series(df[col_real_kg]) if col_real_kg else 0.0
+    df["cliente"] = df[col_cli].fillna("").astype(str).str.strip() if col_cli else ""
     return df[["dISO", "y", "mISO", "wISO", "lReal", "cajas", "kgTeo", "kgReal", "cliente"]]
 
 
-def parse_fic_df(df):
-    df.columns = [str(c).strip() for c in df.columns]
-    date_col = "Fecha (Asignado)" if "Fecha (Asignado)" in df.columns else ("Fecha" if "Fecha" in df.columns else None)
-    if not date_col:
+def parse_fic_df(df, is_daily_txt=False):
+    if df is None or df.empty:
         return pd.DataFrame()
-    df = enrich_dates(df, date_col)
-    if df.empty:
+    df.columns = [str(c).strip() for c in df.columns]
+    col_f_asig = find_col(df, ["Fecha (Asignado)", "Fecha Asignado", "Fecha"])
+    col_f_fich = find_col(df, ["Fichado a", "Fecha finalización"])
+
+    if not col_f_asig and not col_f_fich:
         return pd.DataFrame()
 
-    col_lin = "Línea" if "Línea" in df.columns else None
-    col_real = "Linea real" if "Linea real" in df.columns else None
+    # Si es un TXT diario y una fila suelta tiene 'Fecha (Asignado)' del día anterior pero 'Fichado a' es del día del parte,
+    # usamos la fecha dominante cuando coincide con 'Fichado a' para no machacar el día anterior.
+    dt_asig = parse_robust_dates(df[col_f_asig]) if col_f_asig else pd.Series([pd.NaT] * len(df), index=df.index)
+    if col_f_fich:
+        dt_fich = parse_robust_dates(df[col_f_fich])
+        dt_asig = dt_asig.fillna(dt_fich)
+        if is_daily_txt and len(dt_fich.dropna()) > 0:
+            main_day = dt_fich.dt.strftime("%Y-%m-%d").mode()
+            if len(main_day) > 0:
+                m_day_val = main_day.iloc[0]
+                mask_fix = (dt_fich.dt.strftime("%Y-%m-%d") == m_day_val) & (dt_asig.dt.strftime("%Y-%m-%d") != m_day_val)
+                dt_asig.loc[mask_fix] = dt_fich.loc[mask_fix]
+
+    df = df.loc[dt_asig.notna()].copy()
+    dt = dt_asig.loc[dt_asig.notna()]
+    df["dISO"] = dt.dt.strftime("%Y-%m-%d")
+    df["y"] = dt.dt.strftime("%Y")
+    df["mISO"] = dt.dt.strftime("%Y-%m") + " (" + dt.dt.month.map(MONTH_NAMES) + ")"
+    iso_cal = dt.dt.isocalendar()
+    df["wISO"] = iso_cal["year"].astype(str) + "-W" + iso_cal["week"].apply(lambda x: f"{int(x):02d}")
+
+    col_lin = find_col(df, ["Línea", "Linea", "Línea producción"])
+    col_real = find_col(df, ["Linea real", "Línea real"])
     df["lReal"] = [
         map_linea_real(
             df[col_lin].iloc[i] if col_lin else None,
@@ -297,75 +435,96 @@ def parse_fic_df(df):
         )
         for i in range(len(df))
     ]
-    df["horas"] = clean_num_series(df.get("Total horas", 0))
-    tc = clean_num_series(df.get("Tipo coste", 0)).astype(int)
+    col_horas = find_col(df, ["Total horas", "Horas"])
+    col_tcoste = find_col(df, ["Tipo coste"])
+    col_op = find_col(df, ["Operación", "Operacion"])
+    col_gtr = find_col(df, ["Grupo TRABAJADOR", "Grupo trabajador"])
+
+    df["horas"] = clean_num_series(df[col_horas]) if col_horas else 0.0
+    tc = clean_num_series(df[col_tcoste]).astype(int) if col_tcoste else pd.Series([0] * len(df), index=df.index)
     df["tipoCoste"] = np.where(tc > 0, tc, np.where(df["lReal"].notna(), 1, 2))
-    df["operacion"] = df.get("Operación", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).str.strip().str.upper()
-    df["grupoTrab"] = df.get("Grupo TRABAJADOR", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str).str.strip().str.upper()
+    df["operacion"] = df[col_op].fillna("").astype(str).str.strip().str.upper() if col_op else ""
+    df["grupoTrab"] = df[col_gtr].fillna("").astype(str).str.strip().str.upper() if col_gtr else ""
     return df[["dISO", "y", "mISO", "wISO", "lReal", "horas", "tipoCoste", "operacion", "grupoTrab"]]
 
 
 def read_single_file(uploaded_file):
+    """Lee archivos .txt/.csv probando PRIMERO utf-8 y luego cp1252/latin1 para no romper nunca las tildes."""
     name_low = uploaded_file.name.lower()
     if name_low.endswith((".xlsx", ".xls")):
         xls = pd.ExcelFile(uploaded_file)
         for s_name in xls.sheet_names:
             df_s = pd.read_excel(xls, sheet_name=s_name)
             if not df_s.empty and len(df_s.columns) >= 5:
-                return df_s
+                return df_s, False
     else:
-        for enc in ["latin1", "utf-8", "cp1252"]:
+        for enc in ["utf-8-sig", "utf-8", "cp1252", "latin1"]:
             try:
                 uploaded_file.seek(0)
                 df_s = pd.read_csv(uploaded_file, sep=";", encoding=enc, low_memory=False)
                 if len(df_s.columns) >= 5:
-                    return df_s
+                    return df_s, True
             except Exception:
                 continue
-    return pd.DataFrame()
+    return pd.DataFrame(), False
+
+
+def save_dataframe_to_db(df, table_name, is_daily_upload=False):
+    """Guarda los registros sin machacar días antiguos si en un TXT diario vienen 2 filas residuales de otra fecha."""
+    if df is None or df.empty:
+        return 0
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    if is_daily_upload:
+        # En subida diaria (.txt), solo reemplazamos los días principales del archivo (>15 registros)
+        # o el día mayoritario, evitando borrar días históricos por 1 fila suelta.
+        day_counts = df["dISO"].value_counts()
+        main_days = day_counts[day_counts >= 15].index.tolist()
+        if not main_days and len(day_counts) > 0:
+            main_days = [day_counts.index[0]]
+        # Filtramos el TXT diario a sus días principales para que sea 100% limpio como en tu Excel
+        df = df[df["dISO"].isin(main_days)].copy()
+        placeholders = ",".join(["?"] * len(main_days))
+        c.execute(f"DELETE FROM {table_name} WHERE dISO IN ({placeholders})", main_days)
+    else:
+        days = df["dISO"].dropna().unique().tolist()
+        # Borrar por lotes de 500 fechas para evitar límite de variables de SQLite
+        for i in range(0, len(days), 500):
+            chunk = days[i:i+500]
+            placeholders = ",".join(["?"] * len(chunk))
+            c.execute(f"DELETE FROM {table_name} WHERE dISO IN ({placeholders})", chunk)
+
+    conn.commit()
+    df.to_sql(table_name, conn, if_exists="append", index=False)
+    conn.close()
+    return len(df)
 
 
 def process_annual_workbook(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     n_m, n_v, n_f = 0, 0, 0
     for s_name in xls.sheet_names:
-        s_up = s_name.strip().upper()
+        s_up = norm_str(s_name)
         if "RESUMEN" in s_up or "DINAMIC" in s_up or "TABLA" in s_up:
             continue
         df_s = pd.read_excel(xls, sheet_name=s_name)
         if df_s.empty or len(df_s.columns) < 4:
             continue
-        cols = [str(c).strip() for c in df_s.columns]
 
-        if "FICHAJ" in s_up or "ID TRABAJADOR" in [c.upper() for c in cols]:
-            n_f += save_dataframe_to_db(parse_fic_df(df_s), "fichajes")
+        if "FICHAJ" in s_up or find_col(df_s, ["ID trabajador", "Total horas"]):
+            n_f += save_dataframe_to_db(parse_fic_df(df_s, is_daily_txt=False), "fichajes", is_daily_upload=False)
         elif "VENTA" in s_up:
-            n_v += save_dataframe_to_db(parse_ven_df(df_s), "mov_ventas")
+            n_v += save_dataframe_to_db(parse_ven_df(df_s), "mov_ventas", is_daily_upload=False)
         elif "PARTE" in s_up or "PRODUCCION" in s_up or "ALMACEN" in s_up:
-            n_m += save_dataframe_to_db(parse_mov_df(df_s), "mov_almacen")
+            n_m += save_dataframe_to_db(parse_mov_df(df_s), "mov_almacen", is_daily_upload=False)
         else:
-            if "ID trabajador" in cols or "Total horas" in cols:
-                n_f += save_dataframe_to_db(parse_fic_df(df_s), "fichajes")
-            elif "Neto real" in cols:
+            if find_col(df_s, ["Neto real"]):
                 if "VENTA" in s_up:
-                    n_v += save_dataframe_to_db(parse_ven_df(df_s), "mov_ventas")
+                    n_v += save_dataframe_to_db(parse_ven_df(df_s), "mov_ventas", is_daily_upload=False)
                 else:
-                    n_m += save_dataframe_to_db(parse_mov_df(df_s), "mov_almacen")
+                    n_m += save_dataframe_to_db(parse_mov_df(df_s), "mov_almacen", is_daily_upload=False)
     return n_m, n_v, n_f
-
-
-def save_dataframe_to_db(df, table_name):
-    if df is None or df.empty:
-        return 0
-    days = df["dISO"].dropna().unique().tolist()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    placeholders = ",".join(["?"] * len(days))
-    c.execute(f"DELETE FROM {table_name} WHERE dISO IN ({placeholders})", days)
-    conn.commit()
-    df.to_sql(table_name, conn, if_exists="append", index=False)
-    conn.close()
-    return len(df)
 
 
 @st.cache_data(ttl=2)
@@ -379,7 +538,7 @@ def load_all_from_db():
 
 
 # =============================================================================
-# 4. BARRA LATERAL: CONFIGURACIÓN Y SUBIDA DE DATOS (EXCEL ANUAL + TXT DIARIO)
+# 4. BARRA LATERAL: CONFIGURACIÓN, SUBIDA DIARIA Y PERSISTENCIA PERMANENTE
 # =============================================================================
 with st.sidebar:
     st.markdown("## 🥑 Natural Tropic S.L.")
@@ -404,18 +563,24 @@ with st.sidebar:
         set_config("RATES", {"dir": rate_dir, "ind": rate_ind, "tol_kg": tol_kg})
 
     st.markdown("---")
-    with st.expander("🔐 Panel de Ingeniero (Subir Datos)", expanded=False):
+    with st.expander("🔐 Panel de Ingeniero (Subir Datos / Fijar Web)", expanded=False):
         pin_input = st.text_input("PIN de Ingeniero (1234)", type="password")
         if pin_input == ADMIN_PIN:
-            st.success("Modo Ingeniero Activo")
-            st.markdown("**A) Subir Libros Excel Anuales (4 pestañas):**")
-            up_annual = st.file_uploader(
-                "Excel 2024, 2025 o 2026 (.xlsx)", type=["xlsx", "xls"], accept_multiple_files=True, key="ann"
-            )
-            st.markdown("**B) Subir Archivos Diarios Sueltos (.txt o .xlsx):**")
+            has_gh_secrets = hasattr(st, "secrets") and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets
+            if has_gh_secrets:
+                st.success("🟢 Auto-Guardado en GitHub: CONECTADO")
+            else:
+                st.warning("🟡 Auto-Guardado GitHub no configurado. Usa el botón de abajo para descargar el .db.gz y subirlo a tu GitHub.")
+
+            st.markdown("**A) Subir Archivos Diarios (.txt en crudo o .xlsx):**")
             up_mov = st.file_uploader("1. Partes Producción (.txt/.xlsx)", type=["txt", "csv", "xlsx"], accept_multiple_files=True, key="d_mov")
             up_ven = st.file_uploader("2. Mov. Ventas (.txt/.xlsx)", type=["txt", "csv", "xlsx"], accept_multiple_files=True, key="d_ven")
             up_fic = st.file_uploader("3. Fichajes Personal (.txt/.xlsx)", type=["txt", "csv", "xlsx"], accept_multiple_files=True, key="d_fic")
+
+            st.markdown("**B) Subir Libros Excel Anuales (4 pestañas):**")
+            up_annual = st.file_uploader(
+                "Excel 2024, 2025 o 2026 (.xlsx)", type=["xlsx", "xls"], accept_multiple_files=True, key="ann"
+            )
 
             if st.button("🚀 Procesar y Publicar Datos", type="primary", use_container_width=True):
                 tot_m, tot_v, tot_f = 0, 0, 0
@@ -424,15 +589,48 @@ with st.sidebar:
                         nm, nv, nf = process_annual_workbook(f)
                         tot_m += nm; tot_v += nv; tot_f += nf
                     for f in up_mov or []:
-                        tot_m += save_dataframe_to_db(parse_mov_df(read_single_file(f)), "mov_almacen")
+                        df_raw, is_txt = read_single_file(f)
+                        tot_m += save_dataframe_to_db(parse_mov_df(df_raw), "mov_almacen", is_daily_upload=is_txt)
                     for f in up_ven or []:
-                        tot_v += save_dataframe_to_db(parse_ven_df(read_single_file(f)), "mov_ventas")
+                        df_raw, is_txt = read_single_file(f)
+                        tot_v += save_dataframe_to_db(parse_ven_df(df_raw), "mov_ventas", is_daily_upload=is_txt)
                     for f in up_fic or []:
-                        tot_f += save_dataframe_to_db(parse_fic_df(read_single_file(f)), "fichajes")
+                        df_raw, is_txt = read_single_file(f)
+                        tot_f += save_dataframe_to_db(parse_fic_df(df_raw, is_daily_txt=is_txt), "fichajes", is_daily_upload=is_txt)
+                ok_gh, msg_gh = sync_db_to_github()
                 st.cache_data.clear()
-                st.success(f"✅ Guardado: +{tot_m} Partes | +{tot_v} Ventas | +{tot_f} Fichajes")
+                st.success(f"✅ Guardado: +{tot_m} Partes | +{tot_v} Ventas | +{tot_f} Fichajes\n\n{msg_gh}")
                 st.rerun()
 
+            st.markdown("---")
+            st.markdown("**C) Fijar Datos Permanentemente (.db.gz):**")
+            if os.path.exists(DB_FILE):
+                create_compressed_backup()
+                with open(DB_GZ_FILE, "rb") as fp_gz:
+                    st.download_button(
+                        label="💾 Descargar natural_tropic_planta.db.gz (Subir a GitHub)",
+                        data=fp_gz,
+                        file_name="natural_tropic_planta.db.gz",
+                        mime="application/gzip",
+                        use_container_width=True,
+                        help="Sube este archivo a tu repositorio de GitHub para que la web jamás se vacíe tras el fin de semana.",
+                    )
+
+            up_restore = st.file_uploader("📂 Restaurar Copia (.db o .db.gz)", type=["db", "gz"])
+            if up_restore is not None and st.button("⚡ Restaurar Histórico al Instante", use_container_width=True):
+                if up_restore.name.endswith(".gz"):
+                    with gzip.open(up_restore, "rb") as f_in:
+                        with open(DB_FILE, "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                else:
+                    with open(DB_FILE, "wb") as f_out:
+                        f_out.write(up_restore.getbuffer())
+                sync_db_to_github()
+                st.cache_data.clear()
+                st.success("✅ Histórico completo restaurado en 1 segundo.")
+                st.rerun()
+
+            st.markdown("---")
             if st.button("🗑️ Vaciar Base de Datos", use_container_width=True):
                 conn = sqlite3.connect(DB_FILE)
                 conn.execute("DELETE FROM mov_almacen")
@@ -469,7 +667,7 @@ st.markdown(
 if len(all_days) == 0:
     st.info(
         "👈 Abre el **'🔐 Panel de Ingeniero'** en la barra izquierda (PIN: `1234`), "
-        "sube tus Excel anuales de 4 pestañas o los `.txt` diarios y pulsa **'🚀 Procesar y Publicar Datos'**."
+        "sube tus Excel anuales de 4 pestañas, tus `.txt` diarios o restaura tu archivo `.db.gz` y pulsa **'🚀 Procesar y Publicar Datos'**."
     )
     st.stop()
 
@@ -490,7 +688,6 @@ def status_badge_str(line_name, eur_ven_val):
 
 
 def compute_period_metrics(sub_m, sub_v, sub_f, line_filter="TODAS"):
-    """Calcula todas las métricas operativas y de coste para un subconjunto temporal."""
     if line_filter != "TODAS":
         m_d = sub_m[sub_m["lReal"] == line_filter]
         v_d = sub_v[sub_v["lReal"] == line_filter]
@@ -498,7 +695,7 @@ def compute_period_metrics(sub_m, sub_v, sub_f, line_filter="TODAS"):
         h_ind = 0.0
     else:
         m_d = sub_m[sub_m["lReal"].isin(LINES_LIST)]
-        v_d = sub_ven_lines = sub_v[sub_v["lReal"].isin(LINES_LIST)]
+        v_d = sub_v[sub_v["lReal"].isin(LINES_LIST)]
         f_d = sub_f[sub_f["lReal"].isin(LINES_LIST)]
         h_ind = float(sub_f[~sub_f["lReal"].isin(LINES_LIST)]["horas"].sum())
 
@@ -544,7 +741,7 @@ tab_dash, tab_comp, tab_ai, tab_targ, tab_quad = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# FILTROS RÁPIDOS PARA LAS PESTAÑAS GENERALES (1, 3 y 5)
+# PESTAÑA 1: CUADRO DE MANDO GENERAL
 # -----------------------------------------------------------------------------
 with tab_dash:
     st.markdown("##### 🔍 Filtros de Consulta Rápida")
@@ -578,7 +775,6 @@ with tab_dash:
 
     group_mode = f_c6.selectbox("📊 Agrupar Tabla Por", ["Línea Real", "Año", "Mes", "Semana ISO", "Día"])
 
-    # KPIs Superiores
     f_dir_mask = m_fic["lReal"].isin(LINES_LIST)
     tot_h_dir = float(m_fic.loc[f_dir_mask, "horas"].sum())
     tot_h_ind = float(m_fic.loc[~f_dir_mask, "horas"].sum())
@@ -598,14 +794,14 @@ with tab_dash:
     eur_ven_dir = imp_dir / tot_kg_ven if tot_kg_ven > 0 else 0.0
     eur_ven_ind = imp_ind / tot_kg_ven if tot_kg_ven > 0 else 0.0
     eur_ven_tot = eur_ven_dir + eur_ven_ind
-    kgh_ven_tot = tot_kg_ven / tot_h_dir if tot_h_dir > 0 else 0.0
+    kgh_mov_tot = tot_kg_mov / tot_h_dir if tot_h_dir > 0 else 0.0
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Coste MO Directa", f"{imp_dir:,.0f} €", f"{tot_h_dir:,.1f} h ({(tot_h_dir/tot_h_all*100 if tot_h_all>0 else 0):.0f}%)")
     k2.metric("Coste MO Indirecta", f"{imp_ind:,.0f} €", f"{tot_h_ind:,.1f} h ({(tot_h_ind/tot_h_all*100 if tot_h_all>0 else 0):.0f}%)")
     k3.metric("Coste Total Personal", f"{imp_tot:,.0f} €", f"{tot_h_all:,.1f} h totales")
     k4.metric("Movido vs Vendido", f"{tot_kg_mov/1000:,.1f}t / {tot_kg_ven/1000:,.1f}t", f"{(tot_kg_ven/tot_kg_mov*100 if tot_kg_mov>0 else 0):.1f}% vendido")
-    k5.metric("€/Kg Vendido (Directo)", f"{eur_ven_dir:.4f} €", f"{kgh_ven_tot:.1f} Kg/H vendido")
+    k5.metric("€/Kg Vendido (Directo)", f"{eur_ven_dir:.4f} €", f"{kgh_mov_tot:.1f} Kg/H movido")
     k6.metric("€/Kg Vendido (Total c/Ind)", f"{eur_ven_tot:.4f} €", f"+{eur_ven_ind:.4f} €/kg ind.", delta_color="inverse")
 
     col_map = {"Línea Real": "lReal", "Año": "y", "Mes": "mISO", "Semana ISO": "wISO", "Día": "dISO"}
@@ -616,13 +812,15 @@ with tab_dash:
     g_m_teo = m_dir.groupby(g_col)["kgTeo"].sum()
     g_v_real = v_dir.groupby(g_col)["kgReal"].sum()
 
-    idx_keys = sorted(list(set(g_f.index) | set(g_m_real.index) | set(g_v_real.index)))
+    idx_keys = LINES_LIST if (group_mode == "Línea Real" and sel_line == "TODAS") else sorted(list(set(g_f.index) | set(g_m_real.index) | set(g_v_real.index)))
     rows_table = []
     for k in idx_keys:
         h_val = float(g_f.get(k, 0.0))
         mov_val = float(g_m_real.get(k, 0.0))
         teo_val = float(g_m_teo.get(k, 0.0))
         ven_val = float(g_v_real.get(k, 0.0))
+        if h_val == 0 and mov_val == 0 and ven_val == 0:
+            continue
         imp_val = h_val * rate_dir
         pct_v = (ven_val / mov_val * 100.0) if mov_val > 0 else 0.0
         eur_vol = (imp_val / mov_val) if mov_val > 0 else 0.0
@@ -649,35 +847,35 @@ with tab_dash:
 
     df_summary = pd.DataFrame(rows_table)
 
-    ch1, ch2 = st.columns(2)
-    with ch1:
-        fig_cost = go.Figure()
-        fig_cost.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["€/Kg Volcado"], name="€/Kg Volcado (Partes)", marker_color="#f59e0b"))
-        fig_cost.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["€/Kg Vendido"], name="€/Kg Vendido (Facturado)", marker_color="#dc2626"))
-        if group_mode == "Línea Real":
-            fig_cost.add_trace(go.Scatter(
-                x=df_summary[group_mode],
-                y=[targets.get(k, {}).get("eurVen", 0) for k in df_summary[group_mode]],
-                name="Umbral Objetivo (€/Kg)", mode="lines+markers", line=dict(color="#059669", width=3, dash="dot"),
-            ))
-        fig_cost.update_layout(title=f"Coste Unitario por {group_mode} (€/Kg Volcado vs Vendido)", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
-        st.plotly_chart(fig_cost, use_container_width=True)
+    if not df_summary.empty:
+        ch1, ch2 = st.columns(2)
+        with ch1:
+            fig_cost = go.Figure()
+            fig_cost.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["€/Kg Volcado"], name="€/Kg Volcado (Partes)", marker_color="#f59e0b"))
+            fig_cost.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["€/Kg Vendido"], name="€/Kg Vendido (Facturado)", marker_color="#dc2626"))
+            if group_mode == "Línea Real":
+                fig_cost.add_trace(go.Scatter(
+                    x=df_summary[group_mode],
+                    y=[targets.get(k, {}).get("eurVen", 0) for k in df_summary[group_mode]],
+                    name="Umbral Objetivo (€/Kg)", mode="lines+markers", line=dict(color="#059669", width=3, dash="dot"),
+                ))
+            fig_cost.update_layout(title=f"Coste Unitario por {group_mode} (€/Kg Volcado vs Vendido)", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
+            st.plotly_chart(fig_cost, use_container_width=True)
 
-    with ch2:
-        fig_prod = go.Figure()
-        fig_prod.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["Kg/H Movido"], name="Kg/H Movido (Almacén)", marker_color="#2563eb"))
-        fig_prod.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["Kg/H Vendido"], name="Kg/H Vendido (Ventas)", marker_color="#16a34a"))
-        if group_mode == "Línea Real":
-            fig_prod.add_trace(go.Scatter(
-                x=df_summary[group_mode],
-                y=[targets.get(k, {}).get("kghVen", 0) for k in df_summary[group_mode]],
-                name="Objetivo Kg/H Vendido", mode="lines+markers", line=dict(color="#1d4ed8", width=3, dash="dot"),
-            ))
-        fig_prod.update_layout(title=f"Productividad Horaria por {group_mode} (Kg/Hora)", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
-        st.plotly_chart(fig_prod, use_container_width=True)
+        with ch2:
+            fig_prod = go.Figure()
+            fig_prod.add_trace(go.Bar(x=df_summary[group_mode], y=df_summary["Kg/H Movido"], name="Kg/H Movido (Partes Producción)", marker_color="#2563eb"))
+            if group_mode == "Línea Real":
+                fig_prod.add_trace(go.Scatter(
+                    x=df_summary[group_mode],
+                    y=[targets.get(k, {}).get("kghMov", 0) for k in df_summary[group_mode]],
+                    name="Objetivo Kg/H Movido", mode="lines+markers", line=dict(color="#f59e0b", width=3, dash="dot"),
+                ))
+            fig_prod.update_layout(title=f"Productividad de Línea en Planta por {group_mode} (Kg/H Movido)", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
+            st.plotly_chart(fig_prod, use_container_width=True)
 
-    st.markdown(f"#### 📋 Tabla Ejecutiva Consolidada por **{group_mode}**")
-    st.dataframe(df_summary, use_container_width=True, hide_index=True)
+        st.markdown(f"#### 📋 Tabla Ejecutiva Consolidada por **{group_mode}**")
+        st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
     with st.expander("➕ Desplegar Detalle Jerárquico Día a Día por Línea Real (Estilo Tabla Dinámica Excel)"):
         sel_drill_line = st.selectbox("Selecciona Línea para inspeccionar su serie diaria y mensual:", LINES_LIST)
@@ -705,13 +903,13 @@ with tab_dash:
 
 
 # =============================================================================
-# PESTAÑA 2 (NUEVA): COMPARADOR DE FECHAS / PERIODOS + ANÁLISIS IA ESPECÍFICO
+# PESTAÑA 2: COMPARADOR DE FECHAS (GRÁFICA 1: COSTES | GRÁFICA 2: KG/H MOVIDO)
 # =============================================================================
 with tab_comp:
     st.markdown("#### ⚔️ Comparador Cara a Cara de Fechas y Líneas con Análisis IA")
     st.caption(
         "Compara dos años, dos meses, dos semanas, dos días o dos rangos de fechas cualesquiera. "
-        "Puedes analizar **Toda la Empresa en bloque** o aislar **una Línea Real concreta**."
+        "Gráfica 1: **Costes (€/Kg)** | Gráfica 2: **Productividad Real de Línea en Planta (Kg/H Movido en Partes de Producción)**."
     )
 
     c_cfg1, c_cfg2 = st.columns([1, 1])
@@ -728,7 +926,6 @@ with tab_comp:
 
     line_arg = "TODAS" if comp_scope.startswith("TODA") else comp_scope
 
-    # Selección de Periodo A (Base) y Periodo B (Comparado)
     p_col1, p_col2 = st.columns(2)
     if comp_type == "Por Año (2024 vs 2025 vs 2026)":
         opts = sorted(list(set(df_mov["y"].dropna()) | set(df_ven["y"].dropna()) | set(df_fic["y"].dropna())))
@@ -780,7 +977,6 @@ with tab_comp:
     met_a = compute_period_metrics(mov_a, ven_a, fic_a, line_arg)
     met_b = compute_period_metrics(mov_b, ven_b, fic_b, line_arg)
 
-    # Tarjetas de Variación (Periodo B frente a Periodo A)
     st.markdown(f"##### 📊 Resultado Comparativo: **{label_b}** frente a **{label_a}** ({comp_scope})")
     mc1, mc2, mc3, mc4, mc5 = st.columns(5)
 
@@ -802,20 +998,20 @@ with tab_comp:
         delta_color="inverse",
     )
 
-    diff_kgh_ven = met_b["kgh_ven"] - met_a["kgh_ven"]
-    pct_kgh_ven = (diff_kgh_ven / met_a["kgh_ven"] * 100.0) if met_a["kgh_ven"] > 0 else 0.0
-    mc3.metric(
-        "Productividad Kg/H Vendido",
-        f"{met_b['kgh_ven']:.1f} Kg/h",
-        f"{diff_kgh_ven:+.1f} Kg/h ({pct_kgh_ven:+.1f}%)",
-    )
-
     diff_kgh_mov = met_b["kgh_mov"] - met_a["kgh_mov"]
     pct_kgh_mov = (diff_kgh_mov / met_a["kgh_mov"] * 100.0) if met_a["kgh_mov"] > 0 else 0.0
-    mc4.metric(
-        "Velocidad Kg/H Movido",
+    mc3.metric(
+        "Productividad Línea (Kg/H Movido)",
         f"{met_b['kgh_mov']:.1f} Kg/h",
         f"{diff_kgh_mov:+.1f} Kg/h ({pct_kgh_mov:+.1f}%)",
+    )
+
+    diff_kgh_ven = met_b["kgh_ven"] - met_a["kgh_ven"]
+    pct_kgh_ven = (diff_kgh_ven / met_a["kgh_ven"] * 100.0) if met_a["kgh_ven"] > 0 else 0.0
+    mc4.metric(
+        "Kg/H Vendido (Facturado)",
+        f"{met_b['kgh_ven']:.1f} Kg/h",
+        f"{diff_kgh_ven:+.1f} Kg/h ({pct_kgh_ven:+.1f}%)",
     )
 
     diff_conv = met_b["pct_conv"] - met_a["pct_conv"]
@@ -825,11 +1021,10 @@ with tab_comp:
         f"{diff_conv:+.1f} pts (vs {met_a['pct_conv']:.1f}%)",
     )
 
-    # Gráficas Comparativas
+    # GRÁFICA 1: COSTES (€/KG) | GRÁFICA 2: PRODUCTIVIDAD DE LÍNEA (KG/H MOVIDO EN PARTES)
     cg1, cg2 = st.columns(2)
     if line_arg == "TODAS":
-        # Si es Toda la Empresa, comparar línea por línea entre Periodo A y Periodo B
-        l_names, a_costs, b_costs, a_kgh, b_kgh = [], [], [], [], []
+        l_names, a_costs, b_costs, a_kgh_mov, b_kgh_mov = [], [], [], [], []
         for l in LINES_LIST:
             ma = compute_period_metrics(mov_a, ven_a, fic_a, l)
             mb = compute_period_metrics(mov_b, ven_b, fic_b, l)
@@ -837,62 +1032,62 @@ with tab_comp:
                 l_names.append(l)
                 a_costs.append(ma["eur_ven"])
                 b_costs.append(mb["eur_ven"])
-                a_kgh.append(ma["kgh_ven"])
-                b_kgh.append(mb["kgh_ven"])
+                a_kgh_mov.append(ma["kgh_mov"])
+                b_kgh_mov.append(mb["kgh_mov"])
 
         with cg1:
             fig_ca = go.Figure()
             fig_ca.add_trace(go.Bar(x=l_names, y=a_costs, name=f"🅰️ {label_a}", marker_color="#94a3b8"))
             fig_ca.add_trace(go.Bar(x=l_names, y=b_costs, name=f"🅱️ {label_b}", marker_color="#dc2626"))
-            fig_ca.update_layout(title="Comparativa de Coste €/Kg Vendido por Línea Real", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
+            fig_ca.update_layout(title="1. Comparativa de Costes Unitarios (€/Kg Vendido)", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
             st.plotly_chart(fig_ca, use_container_width=True)
 
         with cg2:
             fig_cb = go.Figure()
-            fig_cb.add_trace(go.Bar(x=l_names, y=a_kgh, name=f"🅰️ {label_a}", marker_color="#94a3b8"))
-            fig_cb.add_trace(go.Bar(x=l_names, y=b_kgh, name=f"🅱️ {label_b}", marker_color="#16a34a"))
-            fig_cb.update_layout(title="Comparativa de Velocidad (Kg/H Vendido) por Línea Real", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
+            fig_cb.add_trace(go.Bar(x=l_names, y=a_kgh_mov, name=f"🅰️ {label_a}", marker_color="#94a3b8"))
+            fig_cb.add_trace(go.Bar(x=l_names, y=b_kgh_mov, name=f"🅱️ {label_b}", marker_color="#2563eb"))
+            fig_cb.update_layout(title="2. Productividad de Línea en Partes de Producción (Kg/H Movido)", barmode="group", height=360, margin=dict(t=40, b=30, l=40, r=20))
             st.plotly_chart(fig_cb, use_container_width=True)
     else:
-        # Si es una Línea Específica, mostrar comparativa de Costes y Productividad de esa línea
         with cg1:
             fig_l1 = go.Figure()
             fig_l1.add_trace(go.Bar(x=["€/Kg Volcado", "€/Kg Vendido"], y=[met_a["eur_vol"], met_a["eur_ven"]], name=f"🅰️ {label_a}", marker_color="#64748b"))
             fig_l1.add_trace(go.Bar(x=["€/Kg Volcado", "€/Kg Vendido"], y=[met_b["eur_vol"], met_b["eur_ven"]], name=f"🅱️ {label_b}", marker_color="#dc2626"))
-            fig_l1.update_layout(title=f"Evolución de Costes en {line_arg} ({label_a} vs {label_b})", barmode="group", height=350)
+            fig_l1.update_layout(title=f"1. Costes Unitarios en {line_arg} ({label_a} vs {label_b})", barmode="group", height=350)
             st.plotly_chart(fig_l1, use_container_width=True)
         with cg2:
             fig_l2 = go.Figure()
-            fig_l2.add_trace(go.Bar(x=["Kg/H Movido", "Kg/H Vendido"], y=[met_a["kgh_mov"], met_a["kgh_ven"]], name=f"🅰️ {label_a}", marker_color="#64748b"))
-            fig_l2.add_trace(go.Bar(x=["Kg/H Movido", "Kg/H Vendido"], y=[met_b["kgh_mov"], met_b["kgh_ven"]], name=f"🅱️ {label_b}", marker_color="#16a34a"))
-            fig_l2.update_layout(title=f"Evolución de Productividad en {line_arg} ({label_a} vs {label_b})", barmode="group", height=350)
+            fig_l2.add_trace(go.Bar(
+                x=[f"🅰️ {label_a}", f"🅱️ {label_b}"],
+                y=[met_a["kgh_mov"], met_b["kgh_mov"]],
+                marker_color=["#64748b", "#2563eb"],
+                text=[f"{met_a['kgh_mov']:.1f} Kg/h", f"{met_b['kgh_mov']:.1f} Kg/h"],
+                textposition="auto",
+            ))
+            fig_l2.update_layout(title=f"2. Productividad de Línea en Partes: Kg/H Movido en {line_arg}", height=350)
             st.plotly_chart(fig_l2, use_container_width=True)
 
-    # -------------------------------------------------------------------------
-    # INFORME EJECUTIVO IA ESPECÍFICO DE LA COMPARATIVA (EMPRESA O LÍNEA)
-    # -------------------------------------------------------------------------
     impacto_euros_eficiencia = (met_a["eur_ven"] - met_b["eur_ven"]) * met_b["kg_ven"] if met_a["eur_ven"] > 0 and met_b["kg_ven"] > 0 else 0.0
     estado_coste = "MEJORADO (reducido costes)" if diff_eur_ven < 0 else ("EMPEORADO (encarecido costes)" if diff_eur_ven > 0 else "MANTENIDO")
     color_impacto = "#059669" if impacto_euros_eficiencia >= 0 else "#dc2626"
 
-    # Identificar mejor y peor línea si estamos viendo Toda la Empresa
     detalle_lineas_html = ""
     if line_arg == "TODAS":
         cambios_lineas = []
         for l in LINES_LIST:
             ma = compute_period_metrics(mov_a, ven_a, fic_a, l)
             mb = compute_period_metrics(mov_b, ven_b, fic_b, l)
-            if ma["eur_ven"] > 0 and mb["eur_ven"] > 0 and mb["kg_ven"] > 500:
-                cambios_lineas.append((l, mb["eur_ven"] - ma["eur_ven"], ma["eur_ven"], mb["eur_ven"], mb["kgh_ven"] - ma["kgh_ven"]))
+            if ma["eur_ven"] > 0 and mb["eur_ven"] > 0 and mb["kg_mov"] > 500:
+                cambios_lineas.append((l, mb["eur_ven"] - ma["eur_ven"], ma["eur_ven"], mb["eur_ven"], mb["kgh_mov"] - ma["kgh_mov"]))
         if cambios_lineas:
             cambios_lineas.sort(key=lambda x: x[1])
             mejor_l = cambios_lineas[0]
             peor_l = cambios_lineas[-1]
             detalle_lineas_html = (
                 f"<li><b>Línea con Mayor Mejora en el periodo:</b> <b>{mejor_l[0]}</b> ha pasado de {mejor_l[2]:.4f} €/kg a <b>{mejor_l[3]:.4f} €/kg</b> "
-                f"({mejor_l[1]:+.4f} €/kg, variando su velocidad en {mejor_l[4]:+.1f} Kg/h).</li>"
+                f"({mejor_l[1]:+.4f} €/kg, variando su productividad de línea en <b>{mejor_l[4]:+.1f} Kg/h movidos</b>).</li>"
                 f"<li><b>Línea con Mayor Deterioro / Cuello de Botella:</b> <b>{peor_l[0]}</b> ha pasado de {peor_l[2]:.4f} €/kg a <b>{peor_l[3]:.4f} €/kg</b> "
-                f"({peor_l[1]:+.4f} €/kg, variando su velocidad en {peor_l[4]:+.1f} Kg/h).</li>"
+                f"({peor_l[1]:+.4f} €/kg, variando su productividad de línea en <b>{peor_l[4]:+.1f} Kg/h movidos</b>).</li>"
             )
 
     st.markdown(
@@ -901,11 +1096,12 @@ with tab_comp:
             <h4 style='margin-top:0; color:#0f172a;'>🧠 Informe de Inteligencia Artificial: Diagnóstico de {comp_scope} ({label_a} ➔ {label_b})</h4>
             <ul style='font-size:14px; line-height:1.7; color:#1e293b;'>
                 <li><b>1. Diagnóstico Económico y Céntimos/Kg:</b> En <b>{label_b}</b>, el rendimiento de <b>{comp_scope}</b> ha <b>{estado_coste}</b>.
-                El coste por kilo vendido ha pasado de <b>{met_a['eur_ven']:.4f} €/kg</b> en {label_a} a <b>{met_b['eur_ven']:.4f} €/kg</b> en {label_b} (<b>{pct_eur_ven:+.1f}%</b>).
+                El coste por kilo vendido ha pasado de <b>{met_a['eur_ven']:.4f} €/kg</b> en {label_a} a <b>{met_b['eur_ven']:.4f} €/kg</b> en {label_b} (<b>{pct_eur_ven:+.1f}%</b>),
+                y el coste por kilo volcado en línea ha pasado de <b>{met_a['eur_vol']:.4f} €/kg</b> a <b>{met_b['eur_vol']:.4f} €/kg</b> ({pct_eur_vol:+.1f}%).
                 Para el volumen facturado en {label_b} ({met_b['kg_ven']:,.0f} kg), esta diferencia de eficiencia supone un impacto directo en nómina de
                 <b style='color:{color_impacto};'>{impacto_euros_eficiencia:+,.0f} €</b> ({'ahorro neto generado' if impacto_euros_eficiencia >= 0 else 'sobrecoste absorbido'}).</li>
-                <li><b>2. Ritmo de Línea y Conversión Comercial:</b> La velocidad bruta de línea (volcado/almacén) ha variado de <b>{met_a['kgh_mov']:.1f} Kg/h</b> a <b>{met_b['kgh_mov']:.1f} Kg/h</b> ({pct_kgh_mov:+.1f}%),
-                mientras que la velocidad real de venta facturada ha pasado de <b>{met_a['kgh_ven']:.1f} Kg/h</b> a <b>{met_b['kgh_ven']:.1f} Kg/h</b> ({pct_kgh_ven:+.1f}%).
+                <li><b>2. Productividad de Línea (Kg/H Movido en Partes):</b> La velocidad física de confección en planta ha pasado de <b>{met_a['kgh_mov']:.1f} Kg/h movidos</b> en {label_a}
+                a <b>{met_b['kgh_mov']:.1f} Kg/h movidos</b> en {label_b} (<b>{diff_kgh_mov:+.1f} Kg/h</b>, un <b>{pct_kgh_mov:+.1f}%</b>).
                 El porcentaje de fruta movida que sale directamente a venta ha pasado del <b>{met_a['pct_conv']:.1f}%</b> al <b>{met_b['pct_conv']:.1f}%</b>
                 ({'menos retrabajo/uso interno' if diff_conv >= 0 else 'mayor proporción de fruta enviada a repaso/uso interno'}).</li>
                 <li><b>3. Estructura de Personal en Planta:</b> Las horas de soporte (Auxiliares, Responsables y Ordenador) han pasado de representar el <b>{met_a['pct_sup']:.1f}%</b>
@@ -960,7 +1156,7 @@ with tab_ai:
             ai_cards.append((
                 "ai-card-crit",
                 f"🚨 Desviación de Coste en {l}: {eur_v:.4f} €/kg vendido (+{desv_p:.1f}% sobre objetivo {t_obj['eurVen']:.4f} €)",
-                f"La línea ha invertido {h_tot:.1f} h para facturar {kg_v:,.0f} kg ({(kg_v/h_tot if h_tot>0 else 0):.1f} Kg/h frente a {t_obj['kghVen']:.1f} Kg/h objetivo).",
+                f"La línea ha invertido {h_tot:.1f} h para mover {kg_m:,.0f} kg ({(kg_m/h_tot if h_tot>0 else 0):.1f} Kg/h movido frente a {t_obj['kghMov']:.1f} Kg/h objetivo).",
                 f"Acción a pie de máquina: Verificar microparadas de alimentación o exceso de confección para stock interno (USOINT) en {l}.",
             ))
         if pct_sup > 42.0 and h_tot > 15.0:
@@ -970,7 +1166,6 @@ with tab_ai:
                 f"De {h_tot:.1f} h totales en {l}, {h_sup:.1f} h corresponden a Auxiliar/Responsable/Ordenador y solo {h_env:.1f} h ({pct_env:.1f}%) a Envasado directo.",
                 f"Acción a pie de máquina: Reequilibrar abastecimiento de cartón/paletizado en {l} y reubicar al menos 1 auxiliar en mesa de envasado.",
             ))
-        # SOLO AVISA SI SUPERA LA TOLERANCIA ASUMIDA EN PLANTA (por defecto ±500 kg)
         if abs(give) > tol_kg:
             ai_cards.append((
                 "ai-card-crit" if give > 0 else "ai-card-med",
@@ -1030,6 +1225,7 @@ with tab_targ:
                     "kghMov": round(mm / hh, 2),
                 }
         set_config("TARGETS", targets)
+        sync_db_to_github()
         st.success("✅ Umbrales actualizados con la media histórica global.")
         st.rerun()
 
@@ -1073,12 +1269,13 @@ with tab_targ:
                 "kghMov": float(r["Obj_Kg/H_Movido"]),
             }
         set_config("TARGETS", targets)
+        sync_db_to_github()
         st.success("✅ Umbrales guardados.")
         st.rerun()
 
 
 # =============================================================================
-# PESTAÑA 5 (RESUMIDA Y EXPLICADA): CUADRE DE KILOS EN PARTES (TOLERANCIA ±500 KG)
+# PESTAÑA 5: CUADRE DE KILOS EN PARTES (TOLERANCIA ±500 KG)
 # =============================================================================
 with tab_quad:
     st.markdown(f"#### ⚖️ Resumen de Cuadre de Kilos en Partes de Producción (Tolerancia asumida: ±{int(tol_kg)} kg)")
