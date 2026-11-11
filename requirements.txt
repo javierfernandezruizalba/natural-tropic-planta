@@ -1,5 +1,8 @@
 streamlit
 pandas
 numpy
-openpyxl
 plotly
+openpyxl
+xlrd
+python-calamine
+PyGithub
